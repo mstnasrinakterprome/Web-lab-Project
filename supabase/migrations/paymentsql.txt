@@ -1,0 +1,523 @@
+
+-- ============================================================
+-- PAYMENT / MEMBER DUE REPAIR
+-- Web-lab-Project
+-- ============================================================
+
+-- ============================================================
+-- 1. FIX PAYMENT TOTAL CALCULATION
+-- ============================================================
+-- IMPORTANT:
+-- total_due already contains opening_balance.
+-- Therefore balance = total_due - paid_amount.
+-- Do NOT add opening_balance again.
+
+CREATE OR REPLACE FUNCTION refresh_due_payment_totals(
+  p_due_id uuid
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_paid numeric(12,2);
+  v_balance numeric(12,2);
+BEGIN
+
+  SELECT COALESCE(SUM(amount), 0)
+  INTO v_paid
+  FROM payment_transactions
+  WHERE due_id = p_due_id
+    AND status = 'paid';
+
+  SELECT
+    COALESCE(total_due, 0) - v_paid
+  INTO v_balance
+  FROM member_dues
+  WHERE id = p_due_id;
+
+  UPDATE member_dues
+  SET
+    paid_amount = v_paid,
+
+    balance = v_balance,
+
+    advance_amount =
+      GREATEST(-v_balance, 0),
+
+    remaining_due =
+      GREATEST(v_balance, 0),
+
+    status =
+      CASE
+        WHEN v_balance <= 0
+             AND COALESCE(total_due, 0) > 0
+          THEN 'paid'
+
+        WHEN v_paid > 0
+          THEN 'partial'
+
+        ELSE 'due'
+      END,
+
+    updated_at = now()
+
+  WHERE id = p_due_id;
+
+END;
+$$;
+
+
+-- ============================================================
+-- 2. FIX MEMBER DUE GENERATION
+-- ============================================================
+-- Fixes:
+--   a) NULL other_charge
+--   b) repeated Calculate causing cost duplication
+--   c) previous balance double-counting
+--   d) rent/utility/other monthly cost calculation
+--
+-- Rule:
+-- Current Charge =
+--     Meal Charge
+--   + Monthly Cost
+--   + Manual Other Charge
+--
+-- Opening Balance =
+--     Previous month's signed balance
+--
+-- Total Due =
+--     Current Charge + Opening Balance
+--     but never below 0
+--
+-- Negative opening balance = advance/credit.
+
+CREATE OR REPLACE FUNCTION generate_member_due(
+  p_member_id uuid,
+  p_billing_month date,
+  p_other_charge numeric DEFAULT NULL
+)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+
+  v_month date :=
+    date_trunc(
+      'month',
+      p_billing_month
+    )::date;
+
+  v_hostel uuid;
+
+  v_meal_count numeric := 0;
+
+  v_rate numeric := 0;
+
+  v_meal_charge numeric(12,2) := 0;
+
+  v_cost numeric(12,2) := 0;
+
+  v_previous numeric(12,2) := 0;
+
+  v_other numeric(12,2) := 0;
+
+  v_current_charge numeric(12,2) := 0;
+
+  v_total_due numeric(12,2) := 0;
+
+  v_opening numeric(12,2) := 0;
+
+  v_id uuid;
+
+BEGIN
+
+  -- ==========================================================
+  -- FIND MEMBER / HOSTEL
+  -- ==========================================================
+
+  SELECT hostel_id
+  INTO v_hostel
+  FROM members
+  WHERE id = p_member_id;
+
+  IF v_hostel IS NULL THEN
+    RAISE EXCEPTION 'Member not found';
+  END IF;
+
+
+  -- ==========================================================
+  -- AUTHORIZATION
+  -- ==========================================================
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM members
+    WHERE id = p_member_id
+      AND auth_id = auth.uid()
+  )
+  AND NOT EXISTS (
+    SELECT 1
+    FROM admins
+    WHERE id = v_hostel
+      AND auth_id = auth.uid()
+  ) THEN
+
+    RAISE EXCEPTION 'Not authorized';
+
+  END IF;
+
+
+  -- ==========================================================
+  -- CURRENT MONTH MEAL RATE
+  -- ==========================================================
+
+  SELECT COALESCE(meal_rate, 0)
+  INTO v_rate
+  FROM monthly_meal_rates
+  WHERE hostel_id = v_hostel
+    AND billing_month = v_month;
+
+
+  v_rate := COALESCE(v_rate, 0);
+
+
+  -- ==========================================================
+  -- CURRENT MONTH ACTUAL MEALS
+  -- ==========================================================
+
+  SELECT COALESCE(
+    SUM(
+      (CASE
+        WHEN mr.day_meal THEN 1
+        ELSE 0
+      END)
+      +
+      (CASE
+        WHEN mr.night_meal THEN 1
+        ELSE 0
+      END)
+    ),
+    0
+  )
+  INTO v_meal_count
+
+  FROM meal_records mr
+
+  JOIN meals m
+    ON m.id = mr.meal_id
+
+  WHERE mr.member_id = p_member_id
+    AND m.date >= v_month
+    AND m.date <
+        (v_month + interval '1 month')::date;
+
+
+  -- ==========================================================
+  -- MEAL CHARGE
+  -- ==========================================================
+
+  v_meal_charge :=
+    ROUND(
+      COALESCE(v_meal_count, 0)
+      * COALESCE(v_rate, 0),
+      2
+    );
+
+
+  -- ==========================================================
+  -- MONTHLY RENT / UTILITY / OTHER COST
+  -- ==========================================================
+  -- These are already distributed into
+  -- monthly_cost_allocations.
+  --
+  -- IMPORTANT:
+  -- We calculate this fresh every time.
+  -- Therefore pressing Calculate multiple times
+  -- will NOT duplicate the cost.
+
+  SELECT COALESCE(
+    SUM(a.amount),
+    0
+  )
+  INTO v_cost
+
+  FROM monthly_cost_allocations a
+
+  JOIN monthly_costs c
+    ON c.id = a.cost_id
+
+  WHERE a.member_id = p_member_id
+    AND c.hostel_id = v_hostel
+    AND c.billing_month = v_month;
+
+
+  v_cost := COALESCE(v_cost, 0);
+
+
+  -- ==========================================================
+  -- MANUAL OTHER CHARGE
+  -- ==========================================================
+  -- If explicitly provided, use it.
+  -- Otherwise zero.
+  --
+  -- DO NOT read current member_dues.other_charge here.
+  -- Because other_charge already contains monthly cost.
+  -- Reading it again would duplicate rent/utilities
+  -- every time Calculate is pressed.
+
+  v_other :=
+    COALESCE(
+      p_other_charge,
+      0
+    );
+
+
+  -- ==========================================================
+  -- CURRENT MONTH CHARGE
+  -- ==========================================================
+
+  v_current_charge :=
+      COALESCE(v_meal_charge, 0)
+    + COALESCE(v_cost, 0)
+    + COALESCE(v_other, 0);
+
+
+  -- ==========================================================
+  -- PREVIOUS MONTH SIGNED BALANCE
+  -- ==========================================================
+  -- Positive = previous due
+  -- Negative = previous advance
+
+  SELECT COALESCE(balance, 0)
+  INTO v_previous
+
+  FROM member_dues
+
+  WHERE member_id = p_member_id
+    AND billing_month =
+        (v_month - interval '1 month')::date;
+
+
+  v_opening :=
+    COALESCE(v_previous, 0);
+
+
+  -- ==========================================================
+  -- TOTAL DUE
+  -- ==========================================================
+  -- Example:
+  --
+  -- Previous balance = +500
+  -- Current charge   = 3000
+  -- Total due        = 3500
+  --
+  -- Previous balance = -500
+  -- Current charge   = 3000
+  -- Total due        = 2500
+  --
+  -- Previous balance = -500
+  -- Current charge   = 300
+  -- Total due        = 0
+  -- Remaining 200 becomes advance.
+
+  v_total_due :=
+    GREATEST(
+      v_current_charge + v_opening,
+      0
+    );
+
+
+  -- ==========================================================
+  -- INSERT / UPDATE MONTHLY DUE
+  -- ==========================================================
+
+  INSERT INTO member_dues (
+    member_id,
+    hostel_id,
+    billing_month,
+    meal_charge,
+    other_charge,
+    previous_due,
+    opening_balance,
+    total_due
+  )
+
+  VALUES (
+    p_member_id,
+    v_hostel,
+    v_month,
+
+    COALESCE(v_meal_charge, 0),
+
+    COALESCE(
+      v_other + v_cost,
+      0
+    ),
+
+    CASE
+      WHEN v_opening > 0
+        THEN v_opening
+      ELSE 0
+    END,
+
+    COALESCE(v_opening, 0),
+
+    COALESCE(v_total_due, 0)
+  )
+
+  ON CONFLICT (
+    member_id,
+    billing_month
+  )
+
+  DO UPDATE SET
+
+    meal_charge =
+      EXCLUDED.meal_charge,
+
+    other_charge =
+      EXCLUDED.other_charge,
+
+    previous_due =
+      EXCLUDED.previous_due,
+
+    opening_balance =
+      EXCLUDED.opening_balance,
+
+    total_due =
+      EXCLUDED.total_due,
+
+    updated_at =
+      now()
+
+  RETURNING id
+  INTO v_id;
+
+
+  -- ==========================================================
+  -- REFRESH PAYMENT / BALANCE
+  -- ==========================================================
+
+  PERFORM refresh_due_payment_totals(v_id);
+
+
+  RETURN v_id;
+
+END;
+$$;
+
+
+-- ============================================================
+-- 3. RECREATE HOSTEL DUE GENERATION
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION generate_hostel_dues(
+  p_billing_month date
+)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+
+  v_hostel uuid;
+
+  v_count integer := 0;
+
+  r record;
+
+BEGIN
+
+  -- Find admin hostel
+
+  SELECT id
+  INTO v_hostel
+
+  FROM admins
+
+  WHERE auth_id = auth.uid();
+
+
+  IF v_hostel IS NULL THEN
+    RAISE EXCEPTION 'Admin profile not found';
+  END IF;
+
+
+  -- Recalculate meal rate
+
+  PERFORM calculate_monthly_meal_rate(
+    v_hostel,
+    p_billing_month
+  );
+
+
+  -- Generate every member's due
+
+  FOR r IN
+    SELECT id
+    FROM members
+    WHERE hostel_id = v_hostel
+  LOOP
+
+    PERFORM generate_member_due(
+      r.id,
+      p_billing_month,
+      NULL
+    );
+
+    v_count :=
+      v_count + 1;
+
+  END LOOP;
+
+
+  RETURN v_count;
+
+END;
+$$;
+
+
+-- ============================================================
+-- 4. PERMISSIONS
+-- ============================================================
+
+GRANT EXECUTE
+ON FUNCTION refresh_due_payment_totals(uuid)
+TO authenticated;
+
+GRANT EXECUTE
+ON FUNCTION generate_member_due(uuid, date, numeric)
+TO authenticated;
+
+GRANT EXECUTE
+ON FUNCTION generate_hostel_dues(date)
+TO authenticated;
+
+
+-- ============================================================
+-- 5. REPAIR EXISTING NULL-SENSITIVE DATA
+-- ============================================================
+-- Normally member_dues.other_charge is NOT NULL,
+-- so NULL rows should not exist.
+-- This is just a safe cleanup.
+
+UPDATE member_dues
+SET
+  other_charge = COALESCE(other_charge, 0)
+WHERE other_charge IS NULL;
+
+
+-- ============================================================
+-- DONE
+-- ============================================================
+
+DO $$
+BEGIN
+  RAISE NOTICE
+    'Payment calculation repair completed successfully.';
+END $$;
