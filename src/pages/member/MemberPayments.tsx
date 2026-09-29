@@ -41,6 +41,11 @@ export default function MemberPayments() {
   const [amount, setAmount] = useState('');
   const [method, setMethod] = useState('bkash');
 
+  // =========================================================
+  // NEW: bKash Transaction ID
+  // =========================================================
+  const [transactionId, setTransactionId] = useState('');
+
   const [paying, setPaying] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -72,12 +77,7 @@ export default function MemberPayments() {
   }, []);
 
   // =========================================================
-  // LOAD PAYMENT DATA
-  //
-  // IMPORTANT:
-  // এখানে generate_member_due CALL করা যাবে না।
-  //
-  // Member page শুধু existing calculated due read করবে।
+  // LOAD DATA
   // =========================================================
 
   useEffect(() => {
@@ -94,23 +94,14 @@ export default function MemberPayments() {
       const memberId = (profile as any)?.id;
 
       if (!memberId) {
-        throw new Error('Member profile not found.');
+        throw new Error(
+          'Member profile not found.'
+        );
       }
 
       // =====================================================
-      // IMPORTANT:
-      // DO NOT CALL:
-      //
-      // supabase.rpc('generate_member_due')
-      //
-      // এখানে।
-      //
-      // কারণ member refresh করলে due পুনরায় calculate হয়ে যাবে।
+      // CURRENT MONTH DUE
       // =====================================================
-
-      // -----------------------------------------------------
-      // LOAD CURRENT MONTH DUE
-      // -----------------------------------------------------
 
       const {
         data: dueData,
@@ -126,9 +117,9 @@ export default function MemberPayments() {
         throw dueError;
       }
 
-      // -----------------------------------------------------
-      // LOAD PAYMENT HISTORY
-      // -----------------------------------------------------
+      // =====================================================
+      // PAYMENT HISTORY
+      // =====================================================
 
       const {
         data: paymentData,
@@ -161,9 +152,9 @@ export default function MemberPayments() {
       setDue(dueData);
       setPayments(allPayments);
 
-      // -----------------------------------------------------
-      // FIND CURRENT MONTH PENDING PAYMENT
-      // -----------------------------------------------------
+      // =====================================================
+      // CURRENT MONTH PENDING PAYMENT
+      // =====================================================
 
       const currentDueId = dueData?.id;
 
@@ -177,12 +168,11 @@ export default function MemberPayments() {
 
       setPendingPayment(pending || null);
 
-      // -----------------------------------------------------
-      // PAYMENT AMOUNT
-      // -----------------------------------------------------
+      // =====================================================
+      // DEFAULT PAYMENT AMOUNT
+      // =====================================================
 
       if (pending) {
-        // Pending থাকলে নতুন payment amount দিতে পারবে না
         setAmount('');
       } else if (dueData) {
         const balance = Number(
@@ -190,7 +180,9 @@ export default function MemberPayments() {
         );
 
         if (balance > 0) {
-          setAmount(balance.toFixed(2));
+          setAmount(
+            balance.toFixed(2)
+          );
         } else {
           setAmount('');
         }
@@ -210,6 +202,7 @@ export default function MemberPayments() {
           error?.message ||
           'Could not load payment information.',
       });
+
     } finally {
       setLoading(false);
     }
@@ -220,6 +213,7 @@ export default function MemberPayments() {
   // =========================================================
 
   async function submitPayment() {
+
     // -------------------------------------------------------
     // PREVENT MULTIPLE PENDING PAYMENT
     // -------------------------------------------------------
@@ -237,7 +231,7 @@ export default function MemberPayments() {
     const paymentAmount = Number(amount);
 
     // -------------------------------------------------------
-    // VALIDATE AMOUNT
+    // AMOUNT VALIDATION
     // -------------------------------------------------------
 
     if (
@@ -261,6 +255,36 @@ export default function MemberPayments() {
       return;
     }
 
+    // =======================================================
+    // NEW: bKash TRANSACTION ID VALIDATION
+    // =======================================================
+
+    if (
+      method === 'bkash' &&
+      !transactionId.trim()
+    ) {
+      setMessage({
+        type: 'error',
+        text:
+          'Please enter your bKash Transaction ID.',
+      });
+
+      return;
+    }
+
+    if (
+      method === 'bkash' &&
+      transactionId.trim().length < 6
+    ) {
+      setMessage({
+        type: 'error',
+        text:
+          'Please enter a valid bKash Transaction ID.',
+      });
+
+      return;
+    }
+
     try {
       setPaying(true);
       setMessage(null);
@@ -278,7 +302,7 @@ export default function MemberPayments() {
       }
 
       // -------------------------------------------------------
-      // MEMBER MUST HAVE EXISTING DUE
+      // EXISTING DUE REQUIRED
       // -------------------------------------------------------
 
       if (!due?.id) {
@@ -288,7 +312,7 @@ export default function MemberPayments() {
       }
 
       // -------------------------------------------------------
-      // DATABASE CHECK FOR PENDING PAYMENT
+      // CHECK EXISTING PENDING PAYMENT
       // -------------------------------------------------------
 
       const {
@@ -330,15 +354,26 @@ export default function MemberPayments() {
         return;
       }
 
-      // -------------------------------------------------------
+      // =====================================================
       // TRANSACTION ID
-      // -------------------------------------------------------
+      // =====================================================
+      //
+      // bKash:
+      //     use REAL transaction ID entered by member
+      //
+      // Other methods:
+      //     generate internal reference because
+      //     database transaction_id is NOT NULL.
+      //
+      // =====================================================
 
-      const transactionId =
-        `MAN-${Date.now()}-${Math.random()
-          .toString(36)
-          .slice(2, 8)
-          .toUpperCase()}`;
+      const finalTransactionId =
+        method === 'bkash'
+          ? transactionId.trim()
+          : `MAN-${Date.now()}-${Math.random()
+              .toString(36)
+              .slice(2, 8)
+              .toUpperCase()}`;
 
       // -------------------------------------------------------
       // INSERT PAYMENT
@@ -367,13 +402,16 @@ export default function MemberPayments() {
           provider:
             method,
 
+          // REAL bKASH TRANSACTION ID
           transaction_id:
-            transactionId,
+            finalTransactionId,
 
           status: 'pending',
 
           notes:
-            'Manual payment submitted by member',
+            method === 'bkash'
+              ? 'bKash payment submitted by member'
+              : 'Manual payment submitted by member',
         })
         .select(`
           id,
@@ -386,20 +424,21 @@ export default function MemberPayments() {
         .single();
 
       // -------------------------------------------------------
-      // DUPLICATE PENDING PAYMENT
+      // HANDLE INSERT ERROR
       // -------------------------------------------------------
 
       if (insertError) {
 
+        // Duplicate transaction ID
         if (
           insertError.code === '23505'
         ) {
-          await loadPaymentData();
-
           setMessage({
-            type: 'info',
+            type: 'error',
             text:
-              'A payment request is already pending. Please wait for admin verification.',
+              method === 'bkash'
+                ? 'This bKash Transaction ID has already been submitted.'
+                : 'This payment reference already exists.',
           });
 
           return;
@@ -418,6 +457,8 @@ export default function MemberPayments() {
 
       setAmount('');
 
+      setTransactionId('');
+
       setMessage({
         type: 'success',
         text:
@@ -425,7 +466,7 @@ export default function MemberPayments() {
       });
 
       // Reload only.
-      // This DOES NOT recalculate due.
+      // This does NOT recalculate due.
       await loadPaymentData();
 
     } catch (error: any) {
@@ -487,9 +528,9 @@ export default function MemberPayments() {
 
       <div className="w-full max-w-6xl mx-auto">
 
-        {/* ===================================================
+        {/* =================================================
             HEADER
-        =================================================== */}
+        ================================================= */}
 
         <div className="flex items-end justify-between gap-4 mb-8">
 
@@ -542,21 +583,17 @@ export default function MemberPayments() {
               disabled:opacity-50
             `}
           >
-
             <RefreshCw size={16} />
-
             Refresh
-
           </button>
 
         </div>
 
-        {/* ===================================================
+        {/* =================================================
             MESSAGE
-        =================================================== */}
+        ================================================= */}
 
         {message && (
-
           <div
             className={`
               mb-5
@@ -590,15 +627,13 @@ export default function MemberPayments() {
             </span>
 
           </div>
-
         )}
 
-        {/* ===================================================
+        {/* =================================================
             PENDING PAYMENT
-        =================================================== */}
+        ================================================= */}
 
         {pendingPayment && (
-
           <div
             className={`
               mb-5
@@ -637,16 +672,22 @@ export default function MemberPayments() {
                 </p>
 
                 <p className="text-sm text-slate-500 mt-1">
-
                   Submitted amount:
-
                   <strong className="ml-1">
                     {money(
                       pendingPayment.amount
                     )}
                   </strong>
-
                 </p>
+
+                {pendingPayment.transaction_id && (
+                  <p className="text-sm text-slate-500 mt-1">
+                    Transaction ID:
+                    <strong className="ml-1 font-mono text-indigo-500">
+                      {pendingPayment.transaction_id}
+                    </strong>
+                  </p>
+                )}
 
                 <p className="text-sm text-slate-500 mt-1">
                   Please wait until the admin accepts or rejects this payment.
@@ -657,12 +698,11 @@ export default function MemberPayments() {
             </div>
 
           </div>
-
         )}
 
-        {/* ===================================================
+        {/* =================================================
             TOP SECTION
-        =================================================== */}
+        ================================================= */}
 
         <div className="grid lg:grid-cols-3 gap-5">
 
@@ -751,8 +791,6 @@ export default function MemberPayments() {
 
             </div>
 
-            {/* ADVANCE */}
-
             <div
               className={`
                 mt-4
@@ -838,7 +876,6 @@ export default function MemberPayments() {
                   <p
                     className={`
                       font-bold
-
                       ${
                         isDark
                           ? 'text-amber-300'
@@ -850,16 +887,22 @@ export default function MemberPayments() {
                   </p>
 
                   <p className="text-sm text-slate-500 mt-2">
-
                     Amount:
-
                     <strong className="ml-1">
                       {money(
                         pendingPayment.amount
                       )}
                     </strong>
-
                   </p>
+
+                  {pendingPayment.transaction_id && (
+                    <p className="text-sm text-slate-500 mt-2">
+                      Transaction ID:
+                      <strong className="ml-1 font-mono text-indigo-500">
+                        {pendingPayment.transaction_id}
+                      </strong>
+                    </p>
+                  )}
 
                 </div>
 
@@ -913,11 +956,15 @@ export default function MemberPayments() {
 
                 <select
                   value={method}
-                  onChange={(e) =>
+                  onChange={(e) => {
                     setMethod(
                       e.target.value
-                    )
-                  }
+                    );
+
+                    // Clear transaction ID
+                    // when method changes
+                    setTransactionId('');
+                  }}
                   disabled={paying}
                   className={`
                     w-full
@@ -953,6 +1000,53 @@ export default function MemberPayments() {
 
                 </select>
 
+                {/* =================================================
+                    NEW: BKASH TRANSACTION ID
+                ================================================= */}
+
+                {method === 'bkash' && (
+                  <div className="mt-4">
+
+                    <label className="block text-xs font-bold uppercase tracking-widest text-slate-500">
+                      bKash Transaction ID
+                    </label>
+
+                    <input
+                      type="text"
+                      value={transactionId}
+                      onChange={(e) =>
+                        setTransactionId(
+                          e.target.value
+                        )
+                      }
+                      placeholder="Paste bKash Transaction ID"
+                      disabled={paying}
+                      autoComplete="off"
+                      className={`
+                        w-full
+                        mt-2
+                        px-4
+                        py-3
+                        rounded-xl
+                        border
+
+                        ${
+                          isDark
+                            ? 'bg-slate-900/60 border-white/10 text-white'
+                            : 'bg-slate-50 border-slate-200 text-slate-900'
+                        }
+
+                        disabled:opacity-50
+                      `}
+                    />
+
+                    <p className="text-[11px] text-slate-500 mt-2">
+                      Enter the Transaction ID received after completing your bKash payment.
+                    </p>
+
+                  </div>
+                )}
+
                 {/* SUBMIT */}
 
                 <button
@@ -960,7 +1054,11 @@ export default function MemberPayments() {
                   disabled={
                     paying ||
                     !amount ||
-                    !due?.id
+                    !due?.id ||
+                    (
+                      method === 'bkash' &&
+                      !transactionId.trim()
+                    )
                   }
                   className="
                     w-full
@@ -1005,9 +1103,9 @@ export default function MemberPayments() {
 
         </div>
 
-        {/* ===================================================
+        {/* =================================================
             PAYMENT HISTORY
-        =================================================== */}
+        ================================================= */}
 
         <div
           className={`
@@ -1094,7 +1192,6 @@ export default function MemberPayments() {
                             py-4
                             pr-4
                             font-bold
-
                             ${
                               isDark
                                 ? 'text-white'
@@ -1108,8 +1205,7 @@ export default function MemberPayments() {
                         </td>
 
                         <td className="py-4 pr-4 text-slate-500">
-                          {payment.payment_method ||
-                            '-'}
+                          {payment.payment_method || '-'}
                         </td>
 
                         <td className="py-4 pr-4">
@@ -1120,9 +1216,8 @@ export default function MemberPayments() {
                           />
                         </td>
 
-                        <td className="py-4 pr-4 text-xs text-slate-500">
-                          {payment.transaction_id ||
-                            '-'}
+                        <td className="py-4 pr-4 text-xs font-mono text-indigo-500 break-all">
+                          {payment.transaction_id || '-'}
                         </td>
 
                         <td className="py-4 text-xs text-slate-500">
@@ -1159,7 +1254,7 @@ export default function MemberPayments() {
 }
 
 // ===========================================================
-// STAT COMPONENT
+// STAT
 // ===========================================================
 
 function Stat({
